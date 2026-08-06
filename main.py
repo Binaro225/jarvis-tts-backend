@@ -2,9 +2,10 @@ import os
 import uuid
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import edge_tts
-import boto3
 
 app = FastAPI()
 
@@ -15,56 +16,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Chargement des identifiants R2 depuis l'environnement Render
-R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
-R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
-R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
-R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
-R2_PUBLIC_DOMAIN = os.getenv("R2_PUBLIC_DOMAIN") # ex: https://pub-xxx.r2.dev
-
-# Client S3 pour Cloudflare R2
-s3_client = boto3.client(
-    service_name="s3",
-    endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
-    aws_access_key_id=R2_ACCESS_KEY,
-    aws_secret_access_key=R2_SECRET_KEY,
-    region_name="auto"
-)
+# Dossier temporaire pour stocker les audios sur Render
+AUDIO_DIR = "/tmp/audio_cache"
+os.makedirs(AUDIO_DIR, exist_ok=True)
 
 class TTSPayload(BaseModel):
     text: str
-    voice: str = "fr-FR-HenriNeural" # Voix masculine française Edge
+    voice: str = "fr-FR-HenriNeural"
 
 @app.get("/")
 def health_check():
-    return {"status": "JARVIS TTS Online"}
+    return {"status": "JARVIS TTS Standalone Online"}
 
 @app.post("/tts")
-async def process_tts(data: TTSPayload):
+async def generate_tts(data: TTSPayload, request: Request):
     try:
         filename = f"jarvis_{uuid.uuid4().hex[:10]}.mp3"
-        temp_path = f"/tmp/{filename}"
+        filepath = os.path.join(AUDIO_DIR, filename)
 
-        # 1. Génération audio Microsoft Edge TTS
+        # Génération du fichier MP3 via Edge TTS
         communicate = edge_tts.Communicate(data.text, data.voice)
-        await communicate.save(temp_path)
+        await communicate.save(filepath)
 
-        # 2. Téléversement direct vers Cloudflare R2
-        with open(temp_path, "rb") as audio_file:
-            s3_client.upload_fileobj(
-                audio_file,
-                R2_BUCKET_NAME,
-                filename,
-                ExtraArgs={"ContentType": "audio/mpeg"}
-            )
+        # Génération dynamique de l'URL publique de Render
+        base_url = str(request.base_url).rstrip("/")
+        audio_url = f"{base_url}/audio/{filename}"
 
-        # Nettoyage du fichier local
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
-        # 3. Retourne l'URL Cloudflare R2
-        audio_url = f"{R2_PUBLIC_DOMAIN}/{filename}"
         return {"status": "success", "audio_url": audio_url}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/audio/{filename}")
+async def get_audio(filename: str):
+    filepath = os.path.join(AUDIO_DIR, filename)
+    if os.path.exists(filepath):
+        return FileResponse(filepath, media_type="audio/mpeg")
+    raise HTTPException(status_code=404, detail="Fichier audio non trouvé")
